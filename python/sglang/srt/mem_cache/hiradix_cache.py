@@ -208,6 +208,9 @@ class HiRadixCache(RadixCache):
         )
         self.pending_demote: Dict[int, TreeNode] = {}
         self._last_insert_leaf: Optional[TreeNode] = None
+        self.offload_log_every = int(
+            os.environ.get("SGLANG_HICACHE_OFFLOAD_LOG_EVERY", "100")
+        )
         self.offload_stats = {
             "requests": 0, "nodes_backed": 0, "nodes_demoted": 0,
             "tokens_demoted": 0, "skipped_no_leaf": 0,
@@ -1132,7 +1135,7 @@ class HiRadixCache(RadixCache):
                 self.pending_demote[node.id] = node
         self.offload_stats["requests"] += 1
         self._try_demote_pending()
-        if self.offload_stats["requests"] % 100 == 0:
+        if self.offload_stats["requests"] % self.offload_log_every == 0:
             logger.info(f"[hicache-offload] {self.offload_stats}")
 
     def _try_demote_pending(self) -> None:
