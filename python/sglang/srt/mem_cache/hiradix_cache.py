@@ -193,6 +193,30 @@ class HiRadixCache(RadixCache):
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
+        # --- offload-on-finish (tool-aware KV placement) -------------------------
+        # An agent turn ends with a tool call and then waits seconds for the tool.
+        # Under memory pressure the default path leaves that program's KV on the
+        # device until LRU picks it -- and LRU picks the LEAST recently used,
+        # which in a tool-call workload is the program closest to RESUMING.
+        # With a rid prefix configured, a finished request whose rid matches is
+        # backed up to host immediately and its program-private tail demoted
+        # from the device as soon as the DMA lands, so the device pool holds
+        # only programs that are actually decoding. Shared prefix nodes (those
+        # with more than one child) are backed up but never demoted here.
+        self.offload_on_finish_rid_prefix: Optional[str] = (
+            os.environ.get("SGLANG_HICACHE_OFFLOAD_RID_PREFIX") or None
+        )
+        self.pending_demote: Dict[int, TreeNode] = {}
+        self._last_insert_leaf: Optional[TreeNode] = None
+        self.offload_stats = {
+            "requests": 0, "nodes_backed": 0, "nodes_demoted": 0,
+            "tokens_demoted": 0, "skipped_no_leaf": 0,
+        }
+        if self.offload_on_finish_rid_prefix:
+            logger.info(
+                "[hicache-offload] enabled for rids starting with "
+                f"{self.offload_on_finish_rid_prefix!r}"
+            )
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
         # record the ongoing prefetch requests
@@ -1056,6 +1080,80 @@ class HiRadixCache(RadixCache):
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
+        if self.pending_demote:
+            self._try_demote_pending()
+
+    # ---- offload-on-finish -------------------------------------------------
+
+    def cache_finished_req(self, req, is_insert: bool = True):
+        self._last_insert_leaf = None
+        super().cache_finished_req(req, is_insert)
+        if not self.offload_on_finish_rid_prefix or not is_insert:
+            return
+        rid = getattr(req, "rid", None)
+        if not isinstance(rid, str) or not rid.startswith(
+            self.offload_on_finish_rid_prefix
+        ):
+            return
+        leaf = self._last_insert_leaf
+        if leaf is None or leaf is self.root_node:
+            self.offload_stats["skipped_no_leaf"] += 1
+            return
+        self.offload_program_tail(leaf)
+
+    def offload_program_tail(self, leaf: TreeNode) -> None:
+        """Back up root->leaf, then demote the program-private tail off device.
+
+        Private = the maximal chain of nodes from `leaf` upward that have at
+        most one child. The first node with >1 children is a prefix shared with
+        another program (system prompt, common stem); it is backed up so the
+        write-through invariant holds, but left resident.
+        """
+        path = []
+        n = leaf
+        while n is not None and n is not self.root_node:
+            path.append(n)
+            n = n.parent
+        path.reverse()
+        # top-down: write_backup requires the parent to be backed up first, and
+        # host_value is assigned synchronously so the chain never breaks.
+        for node in path:
+            if node.evicted or node.backuped:
+                continue
+            if self.write_backup(node) > 0:
+                self.offload_stats["nodes_backed"] += 1
+        private = []
+        n = leaf
+        while n is not None and n is not self.root_node and len(n.children) <= 1:
+            private.append(n)
+            n = n.parent
+        for node in private:
+            if not node.evicted:
+                self.pending_demote[node.id] = node
+        self.offload_stats["requests"] += 1
+        self._try_demote_pending()
+        if self.offload_stats["requests"] % 100 == 0:
+            logger.info(f"[hicache-offload] {self.offload_stats}")
+
+    def _try_demote_pending(self) -> None:
+        """Demote every pending node whose backup has landed and which is a free
+        device leaf. Loops because demoting a child can make its parent a leaf.
+        A node locked by a request that already resumed is simply left alone."""
+        progress = True
+        while progress and self.pending_demote:
+            progress = False
+            for nid, node in list(self.pending_demote.items()):
+                if node.evicted:
+                    del self.pending_demote[nid]
+                    continue
+                if not node.backuped or node.write_through_pending_id is not None:
+                    continue  # DMA still in flight
+                if node in self.evictable_leaves:  # on device, leaf, lock_ref == 0
+                    n_tok = self._evict_backuped(node)
+                    self.offload_stats["nodes_demoted"] += 1
+                    self.offload_stats["tokens_demoted"] += n_tok
+                    del self.pending_demote[nid]
+                    progress = True
 
     def loading_check(self, finish_count: Optional[int] = None):
         if finish_count is None:
@@ -1959,6 +2057,9 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
+            self._last_insert_leaf = new_node
+        else:
+            self._last_insert_leaf = node
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
