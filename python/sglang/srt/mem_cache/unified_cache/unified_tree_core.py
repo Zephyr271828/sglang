@@ -488,6 +488,40 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Whether the node is the tree root."""
         return self.node_by_id(node_id) is self.root_node
 
+    # ---- offload-on-finish (tool-aware KV placement) ----
+
+    def program_private_chain(self, leaf_id: NodeId) -> list[NodeId]:
+        node = self._node_arena.get(leaf_id)
+        chain: list[NodeId] = []
+        while (
+            node is not None
+            and node is not self.root_node
+            and len(node.children) <= 1
+        ):
+            chain.append(node.id)
+            node = node.parent
+        return chain
+
+    def demote_readiness(self, node_id: NodeId) -> str:
+        node = self._node_arena.get(node_id)
+        if node is None or node is self.root_node:
+            return "gone"
+        if node.evicted:
+            return "evicted"
+        if len(node.children) > 1:
+            return "shared"
+        if not node.backuped or node.write_through_pending_id is not None:
+            return "backup_pending"
+        if node not in self.evictable_device_leaves:
+            return "busy"
+        return "ready"
+
+    def build_backup_kv_action(self, node_id: NodeId) -> Optional[BackupKV]:
+        node = self._node_arena.get(node_id)
+        if node is None or node is self.root_node or node.evicted:
+            return None
+        return self._build_backup_kv_action(node)
+
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
         return self.node_by_id(node_id).get_last_hash_value()

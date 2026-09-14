@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Queue
@@ -211,6 +212,33 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+
+        # --- offload-on-finish (tool-aware KV placement) -------------------
+        # An agent turn ends with a tool call and then waits seconds for the
+        # tool. By default that program's KV stays on the device until LRU
+        # pressure picks it -- and LRU picks the LEAST recently used, i.e. the
+        # program closest to RESUMING. With a rid prefix configured, a finished
+        # request whose rid matches has its program-private tail (the chain of
+        # nodes with <=1 child) demoted from the device as soon as its host
+        # copy has landed, so the device pool holds only programs that are
+        # actually decoding. Shared prefix nodes are never demoted here.
+        # Reload is the ordinary match_prefix -> load_back path. No-op unless
+        # HiCache is enabled (init_hicache) and the env var is set.
+        self.offload_on_finish_rid_prefix: Optional[str] = (
+            os.environ.get("SGLANG_HICACHE_OFFLOAD_RID_PREFIX") or None
+        )
+        self.offload_log_every = int(
+            os.environ.get("SGLANG_HICACHE_OFFLOAD_LOG_EVERY", "100")
+        )
+        self.pending_demote: dict[NodeId, None] = {}  # insertion-ordered set
+        self.offload_stats = {
+            "requests": 0,
+            "backups_issued": 0,
+            "nodes_demoted": 0,
+            "tokens_demoted": 0,
+            "dropped_shared": 0,
+            "skipped_no_leaf": 0,
+        }
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -678,6 +706,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
+        if self.offload_on_finish_rid_prefix is not None and is_insert:
+            self._offload_on_finish(req, result)
+
         if self.enable_session_radix_cache and result is not None:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
@@ -685,6 +716,75 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+
+    # ---- offload-on-finish (tool-aware KV placement) ----
+
+    def _offload_on_finish(self, req: Req, result: Optional[InsertResult]) -> None:
+        if self.cache_controller is None or self.is_write_back:
+            return
+        rid = getattr(req, "rid", None)
+        if not isinstance(rid, str) or not rid.startswith(
+            self.offload_on_finish_rid_prefix
+        ):
+            return
+        leaf_id = result.last_device_node if result is not None else None
+        if leaf_id is None or self.tree_core.is_root(leaf_id):
+            self.offload_stats["skipped_no_leaf"] += 1
+            return
+        self.offload_program_tail(leaf_id)
+
+    def offload_program_tail(self, leaf_id: NodeId) -> None:
+        """Queue the program-private chain ending at `leaf_id` for demotion.
+
+        Under write_through every new leaf already had its BackupKV emitted at
+        insert (ancestors first). A leaf that matched an existing node may not
+        be backed up yet; issue the backup here so the chain can leave the
+        device. Demotion itself waits for the write-through ack (the backup
+        holds a lock on the node until then) and is driven from writing_check.
+        """
+        chain = self.tree_core.program_private_chain(leaf_id)
+        if not chain:
+            self.offload_stats["skipped_no_leaf"] += 1
+            return
+        if self.tree_core.demote_readiness(chain[0]) == "backup_pending":
+            if not self.tree_core.is_backuped(chain[0]):
+                action = self.tree_core.build_backup_kv_action(chain[0])
+                if action is not None:
+                    if self._execute_and_commit_kv_backup(action) > 0:
+                        self.offload_stats["backups_issued"] += 1
+        for nid in chain:
+            self.pending_demote[nid] = None
+        self.offload_stats["requests"] += 1
+        self._try_demote_pending()
+        if self.offload_stats["requests"] % self.offload_log_every == 0:
+            logger.info(f"[hicache-offload] {self.offload_stats}")
+
+    def _try_demote_pending(self) -> None:
+        """Demote every queued node whose host copy has landed and which is a
+        free device leaf. Loops because demoting a child makes its parent a
+        leaf. A node locked by a request that already resumed simply waits;
+        a node that became shared is dropped (it is a prefix now)."""
+        tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
+        progress = True
+        while progress and self.pending_demote:
+            progress = False
+            for nid in list(self.pending_demote):
+                state = self.tree_core.demote_readiness(nid)
+                if state in ("gone", "evicted"):
+                    del self.pending_demote[nid]
+                elif state == "shared":
+                    del self.pending_demote[nid]
+                    self.offload_stats["dropped_shared"] += 1
+                elif state == "ready":
+                    before = tracker[BASE_COMPONENT_TYPE]
+                    self._demote(nid, tracker)
+                    del self.pending_demote[nid]
+                    self.offload_stats["nodes_demoted"] += 1
+                    self.offload_stats["tokens_demoted"] += (
+                        tracker[BASE_COMPONENT_TYPE] - before
+                    )
+                    progress = True
+                # "backup_pending" / "busy": keep waiting
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -1852,6 +1952,9 @@ class UnifiedRadixCache(BasePrefixCache):
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
+
+        if self.pending_demote:
+            self._try_demote_pending()
 
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""

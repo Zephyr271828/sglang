@@ -150,6 +150,28 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         """Whether the node's KV is already backed up to host."""
         ...
 
+    # ---- offload-on-finish (tool-aware KV placement) ----
+    # Non-abstract so an external TreeCore that does not support proactive
+    # demotion keeps working; the cache treats "unsupported" as a no-op.
+
+    def program_private_chain(self, leaf_id: NodeId) -> list[NodeId]:
+        """Node ids from `leaf_id` upward while each node has at most one child
+        (i.e. the span is private to one program), leaf first. Stops at the
+        first shared node (>1 children) or the root. Empty if unsupported."""
+        return []
+
+    def demote_readiness(self, node_id: NodeId) -> str:
+        """Why a node can or cannot be demoted right now, one of:
+        "gone" (deleted), "evicted" (already host-only), "shared" (>1 children),
+        "backup_pending" (no host copy yet / write-through in flight),
+        "busy" (locked or a child still on device), "ready"."""
+        return "gone"
+
+    def build_backup_kv_action(self, node_id: NodeId) -> Optional[BackupKV]:
+        """BackupKV for the node and its unbacked ancestors (ancestors first),
+        or None if unsupported."""
+        return None
+
     @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
