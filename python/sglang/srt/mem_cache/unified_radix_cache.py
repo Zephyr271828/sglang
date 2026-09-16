@@ -231,6 +231,11 @@ class UnifiedRadixCache(BasePrefixCache):
             os.environ.get("SGLANG_HICACHE_OFFLOAD_LOG_EVERY", "100")
         )
         self.pending_demote: dict[NodeId, None] = {}  # insertion-ordered set
+        # SGLANG_HICACHE_MAMBA_INTERIOR_RELEASE=1: after each finished request,
+        # free the SSM state of its chain's single-child ancestors (see
+        # UnifiedTreeCore.release_interior_mamba_states).
+        self.mamba_interior_release = os.environ.get("SGLANG_HICACHE_MAMBA_INTERIOR_RELEASE", "0") == "1"
+        self.mamba_release_stats = {"requests": 0, "nodes": 0}
         # why storage prefetches do or do not start (logged every 200 requests)
         self.prefetch_stats = {
             "calls": 0, "gate_not_backuped": 0, "below_threshold": 0,
@@ -716,6 +721,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.offload_on_finish_rid_prefix is not None and is_insert:
             self._offload_on_finish(req, result)
+        if self.mamba_interior_release and is_insert and result is not None and result.last_device_node is not None:
+            device_frees = {ct: [] for ct in self.tree_components}
+            host_frees = {ct: [] for ct in self.tree_components}
+            n = self.tree_core.release_interior_mamba_states(result.last_device_node, device_frees, host_frees)
+            if n:
+                self._free_values(device_frees, host_frees)
+                self.mamba_release_stats["nodes"] += n
+                self.mamba_release_stats["requests"] += 1
+                if self.mamba_release_stats["requests"] % 200 == 0:
+                    logger.info(f"[hicache-mamba-release] {self.mamba_release_stats}")
 
         if self.enable_session_radix_cache and result is not None:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT

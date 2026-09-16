@@ -522,6 +522,44 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return None
         return self._build_backup_kv_action(node)
 
+    def release_interior_mamba_states(
+        self,
+        leaf_id: NodeId,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> int:
+        """Free the Mamba (SSM) state of every single-child ancestor of `leaf_id`.
+
+        A program's context is a chain root -> leaf. Only the LEAF's SSM state
+        is needed to resume it; an interior node's state is only useful if a
+        different request branches off at exactly that node, which agent
+        workloads never do (each turn extends its own chain). Each state is
+        ~51 MB for Qwen3.5-4B, one per cached turn boundary, i.e. ~1.2 GB per
+        40k-token program -- about half the host tier. Shared nodes (>1
+        children), locked nodes and the root are left alone. Returns the number
+        of nodes released."""
+        if ComponentType.MAMBA not in self.components_by_type:
+            return 0
+        comp = self.components_by_type[ComponentType.MAMBA]
+        leaf = self._node_arena.get(leaf_id)
+        if leaf is None or leaf is self.root_node:
+            return 0
+        lcd = leaf.component_data[ComponentType.MAMBA]
+        if lcd.value is None and lcd.host_value is None:
+            return 0  # the leaf itself has no state to supersede its ancestors
+        n = 0
+        node = leaf.parent
+        while node is not None and node is not self.root_node and len(node.children) == 1:
+            cd = node.component_data[ComponentType.MAMBA]
+            if (cd.value is not None or cd.host_value is not None) and cd.lock_ref == 0 and cd.host_lock_ref == 0:
+                self._evict_component_and_detach_lru(
+                    node, comp, target=EvictLayer.ALL, tracker=None,
+                    device_frees=device_frees, host_frees=host_frees,
+                )
+                n += 1
+            node = node.parent
+        return n
+
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
         return self.node_by_id(node_id).get_last_hash_value()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -242,11 +243,29 @@ class FullComponent(TreeComponent):
         ]
         heapq.heapify(heap)
         ct = self.component_type
+        whole_program = os.environ.get("SGLANG_HICACHE_HOST_EVICT_WHOLE_PROGRAM", "0") == "1"
         while tracker[ct] < num_tokens and heap:
             _, x = heapq.heappop(heap)
             if x not in self.tree_core.evictable_host_leaves:
                 continue
             self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+            if whole_program:
+                # Keep evicting up this program's private chain (the parent
+                # becomes an H-leaf once its only child is gone) before touching
+                # another program: leaf-wise LRU clips the most recent turn off
+                # many programs, each of which then re-prefills that suffix on
+                # resume; taking whole programs concentrates the damage on few,
+                # and a whole context is what the storage tier can prefetch.
+                p = x.parent
+                while (
+                    tracker[ct] < num_tokens
+                    and p is not None
+                    and p in self.tree_core.evictable_host_leaves
+                ):
+                    nxt = p.parent
+                    self.tree_core._evict_host_leaf(p, tracker, device_frees, host_frees)
+                    p = nxt
+                continue
             if (
                 x.parent is not None
                 and x.parent in self.tree_core.evictable_host_leaves
