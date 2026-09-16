@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -577,9 +578,16 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
     )
+    # SGLANG_HICACHE_MAMBA_HOST_RATIO: size the Mamba host cache independently of
+    # the KV host pool (default: --hicache-ratio for both). With interior SSM
+    # states released (SGLANG_HICACHE_MAMBA_INTERIOR_RELEASE) only ~one state per
+    # live program is needed, so the host RAM budget can go to KV instead.
+    mamba_host_ratio = float(
+        os.environ.get("SGLANG_HICACHE_MAMBA_HOST_RATIO", str(server_args.hicache_ratio))
+    )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        server_args.hicache_ratio,
+        mamba_host_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(server_args),
         layout=server_args.hicache_mem_layout,
