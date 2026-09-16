@@ -419,6 +419,18 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
+        # SGLANG_HICACHE_FILE_BACKEND_IO_THREADS (default 1 = serial, unchanged):
+        # thread pool for per-page reads/writes in batch_get_v2 / batch_set_v2.
+        io_threads = int(os.environ.get("SGLANG_HICACHE_FILE_BACKEND_IO_THREADS", "1"))
+        self._io_pool = None
+        if io_threads > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._io_pool = ThreadPoolExecutor(
+                max_workers=io_threads, thread_name_prefix="hicache-file-io"
+            )
+            logger.info(f"HiCacheFile: per-page I/O thread pool of {io_threads}")
+
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
@@ -687,10 +699,22 @@ class HiCacheFile(HiCacheStorage):
                 results[transfer.name] = [False] * len(keys)
                 continue
 
-            results[transfer.name] = [
-                op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
-                for i, key in enumerate(keys)
-            ]
+            if self._io_pool is not None and len(keys) > 1:
+                # I/O-bound per-page ops (pinned-buffer slice + file write/read);
+                # the serial loop caps a NVMe RAID at a few hundred MB/s and, in
+                # write-through mode, lets the L3 backlog grow to tens of seconds.
+                offsets = [host_indices[i * page_size].item() for i in range(len(keys))]
+                results[transfer.name] = list(
+                    self._io_pool.map(
+                        lambda a: op_fn(transfer.name, a[0], host_pool, a[1]),
+                        zip(keys, offsets),
+                    )
+                )
+            else:
+                results[transfer.name] = [
+                    op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
+                    for i, key in enumerate(keys)
+                ]
         return results
 
     def batch_get_v2(

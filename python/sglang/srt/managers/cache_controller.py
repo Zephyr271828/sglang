@@ -1092,6 +1092,19 @@ class HiCacheController:
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
+                    self._prefetch_revoke_debug_count = getattr(self, "_prefetch_revoke_debug_count", 0) + 1
+                    if self._prefetch_revoke_debug_count % 50 == 1 and not operation.is_terminated():
+                        try:
+                            ph = self.get_hash_str(operation.token_ids, operation.last_hash, page_size=self.page_size)
+                            first = ph[:2]
+                            ex = [self.storage_backend.exists(k) for k in first]
+                            logger.info(
+                                f"[hicache-storage] revoke#{self._prefetch_revoke_debug_count}: tokens={len(operation.token_ids)} "
+                                f"pages={len(ph)} hits={storage_hit_count} last_hash={'none' if operation.last_hash is None else operation.last_hash[:8]} "
+                                f"first_keys={[k[:8] for k in first]} exists={ex}"
+                            )
+                        except Exception as e:  # diagnostic only
+                            logger.info(f"[hicache-storage] revoke debug failed: {e}")
                 else:
                     # Record hit count, so the scheduler thread will know the exact memory to allocate
                     operation.hash_value = hash_value[
