@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from functools import cache
@@ -481,7 +482,16 @@ class HiCacheController:
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+            # SGLANG_HICACHE_PREFETCH_CAPACITY_RATIO overrides the 0.5: a prefetch is attempted once, at
+            # request arrival, and skipped for good when the outstanding prefetch buffers exceed this
+            # budget -- with a deep waiting queue that starves the storage tier of requests.
+            prefetch_capacity_ratio = float(
+                os.environ.get("SGLANG_HICACHE_PREFETCH_CAPACITY_RATIO", "0.5")
+            )
+            self.prefetch_capacity_limit = int(
+                prefetch_capacity_ratio * self.mem_pool_host.size
+            )
+            self.prefetch_rate_limited_count = 0
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -1016,6 +1026,12 @@ class HiCacheController:
         """
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            self.prefetch_rate_limited_count += 1
+            if self.prefetch_rate_limited_count % 100 == 1:
+                logger.info(
+                    f"[hicache-storage] prefetch rate-limited: {self.prefetch_rate_limited_count} skipped so far "
+                    f"(occupied {self.prefetch_tokens_occupied} >= limit {self.prefetch_capacity_limit})"
+                )
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
