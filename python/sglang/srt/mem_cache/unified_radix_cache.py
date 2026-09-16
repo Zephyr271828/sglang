@@ -235,6 +235,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_stats = {
             "calls": 0, "gate_not_backuped": 0, "below_threshold": 0,
             "rate_limited": 0, "aux_alloc_failed": 0, "started": 0, "started_tokens": 0,
+            "storage_hits_below_threshold": 0, "host_alloc_failed": 0,
+            "no_host_buffer_at_schedule": 0, "hybrid_check_failed": 0,
+            "completed": 0, "completed_tokens": 0,
         }
         self.offload_stats = {
             "requests": 0,
@@ -1416,6 +1419,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self.can_terminate_prefetch(operation):
             return False
         if operation.host_indices is None:
+            # never got a host buffer: storage query below threshold (revoked by
+            # the prefetch thread) or the request was scheduled before the query answered
+            self.prefetch_stats["no_host_buffer_at_schedule"] += 1
             self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(req_id)
             return True
@@ -1436,7 +1442,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if min_completed_tokens is None:
             # Hybrid all-or-nothing check failed; result already discarded.
+            self.prefetch_stats["hybrid_check_failed"] += 1
             return True
+        self.prefetch_stats["completed"] += 1
+        self.prefetch_stats["completed_tokens"] += min_completed_tokens
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self.tree_core.insert_host(
@@ -1660,7 +1669,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 yield item
 
         def _drain_revoke():
+            # every entry here is a prefetch the storage thread revoked for
+            # insufficient hits (see cache_controller.prefetch_thread_func)
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                self.prefetch_stats["storage_hits_below_threshold"] += 1
                 self._revoke_pending_prefetch(req_id)
 
         def _drain_and_alloc_storage_hit():
@@ -1690,6 +1702,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     if alloc_len >= self.prefetch_threshold:
                         host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
+                    self.prefetch_stats["host_alloc_failed"] += 1
                     self._revoke_pending_prefetch(req_id)
                     continue
 
