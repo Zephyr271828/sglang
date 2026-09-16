@@ -39,7 +39,9 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import json
 import logging
+import os
 import re
 import sys
 from array import array
@@ -766,6 +768,48 @@ class ReqKvInfo:
     #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
     # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
     swa_evicted_seqlen: int
+
+
+_REQ_TIME_STATS_JSONL_PATH = os.environ.get("SGLANG_REQ_TIME_STATS_JSONL") or None
+_req_time_stats_jsonl_fh = None
+
+
+def _write_req_time_stats_jsonl(req: "Req") -> None:
+    """SGLANG_REQ_TIME_STATS_JSONL=<path>: one JSON line per finished request
+    with the queue / prefill / decode split (seconds) and token counts, keyed
+    by rid so a client can join its own per-turn timings. Needs
+    --enable-request-time-stats-logging (this runs from log_time_stats).
+
+    prefill = forward_entry -> first output token: it includes the host->device
+    load-back wait when the prefix was on the HiCache host tier, and every
+    chunk of a chunked prefill. queue = wait_queue_entry -> forward_entry.
+    """
+    global _req_time_stats_jsonl_fh
+    if _REQ_TIME_STATS_JSONL_PATH is None:
+        return
+    ts = req.time_stats
+    if _req_time_stats_jsonl_fh is None:
+        _req_time_stats_jsonl_fh = open(_REQ_TIME_STATS_JSONL_PATH, "a", buffering=1)
+    from sglang.srt.observability.req_time_stats import global_diff_realtime_monotonic
+
+    def d(a, b):
+        return round(b - a, 4) if a > 0 and b > 0 else None
+
+    rec = {
+        "rid": req.rid,
+        "input_len": len(req.origin_input_ids),
+        "cached": req.cached_tokens,
+        "output_len": len(req.output_ids),
+        "attempts": req.prefill_attempt_count,
+        "recv_to_queue": d(ts.scheduler_recv_time, ts.wait_queue_entry_time),
+        "queue": d(ts.wait_queue_entry_time, ts.forward_entry_time),
+        "prefill": d(ts.forward_entry_time, ts.prefill_finished_time),
+        "decode": d(ts.prefill_finished_time, ts.completion_time),
+        "total": d(ts.wait_queue_entry_time, ts.completion_time),
+        "t_queue_entry": round(ts.wait_queue_entry_time + global_diff_realtime_monotonic, 3),
+        "t_done": round(ts.completion_time + global_diff_realtime_monotonic, 3),
+    }
+    _req_time_stats_jsonl_fh.write(json.dumps(rec) + "\n")
 
 
 class Req(ReqDllmMixin):
@@ -1733,6 +1777,7 @@ class Req(ReqDllmMixin):
         )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
+        _write_req_time_stats_jsonl(self)
 
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:

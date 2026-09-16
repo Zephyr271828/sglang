@@ -123,6 +123,9 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # (tool_name, finish_wallclock) parsed from the finished output that
+        # ends at this node; consumed by tool-aware host eviction ordering.
+        self.tool_hint: Optional[tuple[str, float]] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -521,6 +524,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if node is None or node is self.root_node or node.evicted:
             return None
         return self._build_backup_kv_action(node)
+
+    def set_tool_hint(self, node_id: NodeId, hint: Optional[tuple[str, float]]) -> bool:
+        node = self._node_arena.get(node_id)
+        if node is None or node is self.root_node:
+            return False
+        node.tool_hint = hint
+        return True
 
     def release_interior_mamba_states(
         self,

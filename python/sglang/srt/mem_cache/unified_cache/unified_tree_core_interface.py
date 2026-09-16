@@ -172,6 +172,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         or None if unsupported."""
         return None
 
+    def set_tool_hint(self, node_id: NodeId, hint: Optional[tuple[str, float]]) -> bool:
+        """Record (tool_name, finish_wallclock) on the leaf that ends a finished
+        program turn, for tool-aware host eviction ordering. False if unsupported."""
+        return False
+
     @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""

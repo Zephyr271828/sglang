@@ -531,6 +531,12 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if getattr(self.tree_cache, "tool_hint_rid_prefix", None) is not None:
+            # SGLANG_HICACHE_TOOL_HINT: the cache parses tool calls from output ids
+            if self.tokenizer is not None:
+                self.tree_cache.tool_hint_decode = self.tokenizer.decode
+            else:
+                logger.warning("SGLANG_HICACHE_TOOL_HINT set but no tokenizer; hints disabled")
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 

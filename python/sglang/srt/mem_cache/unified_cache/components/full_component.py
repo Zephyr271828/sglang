@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import logging
 import os
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -36,6 +37,19 @@ if TYPE_CHECKING:
         UnifiedTreeNode,
     )
 
+logger = logging.getLogger(__name__)
+
+# SGLANG_HICACHE_HOST_EVICT_ORDER: lru (default) | tool | tool_dead_first.
+# See FullComponent.drive_host_eviction. Lower rank is evicted first.
+_HOST_EVICT_ORDER = os.environ.get("SGLANG_HICACHE_HOST_EVICT_ORDER", "lru")
+_HOST_EVICT_RANKS = {
+    "tool": {"visit": 0, "search": 1, "other": 1, "none": 1},
+    "tool_dead_first": {"none": 0, "visit": 1, "search": 2, "other": 2},
+}
+_HOST_EVICT_LOG_EVERY = int(os.environ.get("SGLANG_HICACHE_OFFLOAD_LOG_EVERY", "500"))
+if _HOST_EVICT_ORDER not in ("lru", *_HOST_EVICT_RANKS):
+    raise ValueError(f"SGLANG_HICACHE_HOST_EVICT_ORDER={_HOST_EVICT_ORDER!r} unknown")
+
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
@@ -44,6 +58,7 @@ class FullComponent(TreeComponent):
         super().__init__(cache, params)
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
+        self.host_evict_class_stats = {"calls": 0, "visit": 0, "search": 0, "other": 0, "none": 0}
         # Lazy bind eviction strategy since tree core is initialized after component init.
         self.session_ref_eviction_strategy = (
             self._session_ref_eviction_strategy
@@ -237,10 +252,25 @@ class FullComponent(TreeComponent):
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
-        heap = [
-            (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_host_leaves
-        ]
+        order = _HOST_EVICT_ORDER
+        if order == "lru":
+            key = self.session_ref_eviction_strategy
+        else:
+            # Tool-aware order (needs SGLANG_HICACHE_TOOL_HINT on the cache):
+            # rank programs by the tool they are waiting on, LRU within a rank.
+            #   tool            : visit (slow) first, then search / other / untagged
+            #   tool_dead_first : untagged or no-call leaves (extractor calls,
+            #                     answered items: never resumed) first, then
+            #                     visit, then search / other
+            ranks = _HOST_EVICT_RANKS[order]
+            base = self.session_ref_eviction_strategy
+
+            def key(n, ranks=ranks, base=base):
+                h = n.tool_hint
+                cls = "none" if h is None else (h[0] if h[0] in ("search", "visit") else "other")
+                return (ranks[cls], base(n))
+
+        heap = [(key(n), n) for n in self.tree_core.evictable_host_leaves]
         heapq.heapify(heap)
         ct = self.component_type
         whole_program = os.environ.get("SGLANG_HICACHE_HOST_EVICT_WHOLE_PROGRAM", "0") == "1"
@@ -248,6 +278,14 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.tree_core.evictable_host_leaves:
                 continue
+            if order != "lru":
+                h = x.tool_hint
+                self.host_evict_class_stats[
+                    "none" if h is None else (h[0] if h[0] in ("search", "visit") else "other")
+                ] += 1
+                self.host_evict_class_stats["calls"] += 1
+                if self.host_evict_class_stats["calls"] % _HOST_EVICT_LOG_EVERY == 0:
+                    logger.info(f"[hicache-host-evict-order={order}] {self.host_evict_class_stats}")
             self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
             if whole_program:
                 # Keep evicting up this program's private chain (the parent
@@ -270,10 +308,7 @@ class FullComponent(TreeComponent):
                 x.parent is not None
                 and x.parent in self.tree_core.evictable_host_leaves
             ):
-                heapq.heappush(
-                    heap,
-                    (self.session_ref_eviction_strategy(x.parent), x.parent),
-                )
+                heapq.heappush(heap, (key(x.parent), x.parent))
 
     def acquire_component_lock(
         self,

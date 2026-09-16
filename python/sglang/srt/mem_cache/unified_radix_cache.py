@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from queue import Empty, Queue
@@ -236,6 +237,18 @@ class UnifiedRadixCache(BasePrefixCache):
         # UnifiedTreeCore.release_interior_mamba_states).
         self.mamba_interior_release = os.environ.get("SGLANG_HICACHE_MAMBA_INTERIOR_RELEASE", "0") == "1"
         self.mamba_release_stats = {"requests": 0, "nodes": 0}
+        # SGLANG_HICACHE_TOOL_HINT=<rid prefix>: on every finished request whose
+        # rid carries the prefix, parse the tool call that ends its output
+        # (`<function=NAME>`) and stamp (NAME, now) on the leaf node. Requests
+        # without the prefix (extractor calls) or without a call (final
+        # answers) get None = "never comes back". Consumed by
+        # SGLANG_HICACHE_HOST_EVICT_ORDER in FullComponent.drive_host_eviction.
+        # The scheduler injects tool_hint_decode (tokenizer.decode) after init.
+        self.tool_hint_rid_prefix: Optional[str] = (
+            os.environ.get("SGLANG_HICACHE_TOOL_HINT") or None
+        )
+        self.tool_hint_decode = None
+        self.tool_hint_stats = {"requests": 0, "search": 0, "visit": 0, "other": 0, "none": 0}
         # why storage prefetches do or do not start (logged every 200 requests)
         self.prefetch_stats = {
             "calls": 0, "gate_not_backuped": 0, "below_threshold": 0,
@@ -719,6 +732,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
+        if (
+            self.tool_hint_rid_prefix is not None
+            and is_insert
+            and result is not None
+            and result.last_device_node is not None
+        ):
+            self._set_tool_hint(req, result.last_device_node)
         if self.offload_on_finish_rid_prefix is not None and is_insert:
             self._offload_on_finish(req, result)
         if self.mamba_interior_release and is_insert and result is not None and result.last_device_node is not None:
@@ -739,6 +759,34 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+
+    # ---- tool hint (tool-aware host eviction order) ----
+
+    _TOOL_CALL_RE = re.compile(r"<function=(\w+)>")
+
+    def _set_tool_hint(self, req: Req, leaf_id: NodeId) -> None:
+        hint = None
+        rid = getattr(req, "rid", None)
+        if (
+            isinstance(rid, str)
+            and rid.startswith(self.tool_hint_rid_prefix)
+            and self.tool_hint_decode is not None
+            and req.output_ids
+        ):
+            try:
+                tail = self.tool_hint_decode(req.output_ids[-256:], skip_special_tokens=False)
+                m = self._TOOL_CALL_RE.findall(tail)
+                if m:
+                    hint = (m[-1], time.time())
+            except Exception as e:  # never let logging break caching
+                logger.warning(f"[hicache-tool-hint] decode failed: {e}")
+        if self.tree_core.set_tool_hint(leaf_id, hint):
+            st = self.tool_hint_stats
+            st["requests"] += 1
+            k = "none" if hint is None else (hint[0] if hint[0] in ("search", "visit") else "other")
+            st[k] += 1
+            if st["requests"] % self.offload_log_every == 0:
+                logger.info(f"[hicache-tool-hint] {st}")
 
     # ---- offload-on-finish (tool-aware KV placement) ----
 
