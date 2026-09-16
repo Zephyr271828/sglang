@@ -231,6 +231,11 @@ class UnifiedRadixCache(BasePrefixCache):
             os.environ.get("SGLANG_HICACHE_OFFLOAD_LOG_EVERY", "100")
         )
         self.pending_demote: dict[NodeId, None] = {}  # insertion-ordered set
+        # why storage prefetches do or do not start (logged every 200 requests)
+        self.prefetch_stats = {
+            "calls": 0, "gate_not_backuped": 0, "below_threshold": 0,
+            "rate_limited": 0, "aux_alloc_failed": 0, "started": 0, "started_tokens": 0,
+        }
         self.offload_stats = {
             "requests": 0,
             "backups_issued": 0,
@@ -1267,6 +1272,8 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
+        st = self.prefetch_stats
+        st["calls"] += 1
 
         extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
@@ -1275,10 +1282,13 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if prefetch_length < self.prefetch_threshold:
+            st["below_threshold"] += 1
+            self._log_prefetch_stats()
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            st["rate_limited"] += 1
+            self._log_prefetch_stats()
             return
 
         anchor_lock_params = self.inc_host_lock_ref(last_host_node_id).to_dec_params()
@@ -1316,7 +1326,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
             )
             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+            st["aux_alloc_failed"] += 1
+            self._log_prefetch_stats()
             return
+        st["started"] += 1
+        st["started_tokens"] += len(prefetch_key)
+        self._log_prefetch_stats()
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1336,6 +1351,12 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+    def _log_prefetch_stats(self) -> None:
+        st = self.prefetch_stats
+        n = st["calls"] + st["gate_not_backuped"]
+        if n % 200 == 0:
+            logger.info(f"[hicache-storage] prefetch stats {st}")
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
