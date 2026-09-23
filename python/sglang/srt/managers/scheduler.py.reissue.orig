@@ -322,11 +322,6 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# Re-issue the HiCache L3 lookup when a queued request loses its cached prefix
-# before admission (see Scheduler._prefetch_after_device_hit_loss).
-_L3_REISSUE = os.environ.get("SGLANG_L3_REISSUE_ON_HIT_LOSS", "0") == "1"
-_L3_REISSUE_MAX = int(os.environ.get("SGLANG_L3_REISSUE_MAX_ATTEMPTS", "3"))
-
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -427,11 +422,6 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_session_radix_cache = server_args.enable_session_radix_cache
-        self._l3_reissue_stats = {
-            "reissued": 0,
-            "capped": 0,
-            "tokens_exposed": 0,
-        }
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
@@ -2619,9 +2609,6 @@ class Scheduler(
                 req.last_host_node
             ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                # remember what the lookup was computed against, so a queue-time
-                # eviction can be detected before admission (upstream main)
-                req.storage_prefetch_last_match_len = matched_len
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
@@ -2638,40 +2625,6 @@ class Scheduler(
                     tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                 )
-
-    def _prefetch_after_device_hit_loss(self, req: Req) -> bool:
-        """Re-query an L3 range newly exposed by queue-time eviction.
-
-        The prefetch fires once, at `_add_request_to_queue`. At c=256 a request
-        then waits ~320 s in the waiting queue and its host prefix is evicted
-        meanwhile, so the lookup that ran asked only about the new tool result
-        (~2k tokens) while the admitted request needs ~25k. Measured 2026-09-23:
-        1,220 of 1,342 cold turns took that path. Backport of upstream main's
-        `_prefetch_after_device_hit_loss` / `storage_prefetch_retries`.
-        """
-        if not _L3_REISSUE:
-            return False
-        prev = getattr(req, "storage_prefetch_last_match_len", None)
-        if not prev:
-            return False
-        if req.rid in getattr(self.tree_cache, "ongoing_prefetch", {}):
-            return False  # a lookup is already in flight for this request
-        current = len(req.prefix_indices) + req.host_hit_length
-        if current >= prev:
-            return False
-        n = getattr(req, "storage_prefetch_retry_attempts", 0)
-        if n >= _L3_REISSUE_MAX:
-            # past the cap, admit with the shorter live match
-            req.storage_prefetch_last_match_len = current
-            self._l3_reissue_stats["capped"] += 1
-            return False
-        req.storage_prefetch_retry_attempts = n + 1
-        self._l3_reissue_stats["reissued"] += 1
-        self._l3_reissue_stats["tokens_exposed"] += prev - current
-        if self._l3_reissue_stats["reissued"] % 200 == 0:
-            logger.info(f"[l3-reissue] {self._l3_reissue_stats}")
-        self._prefetch_kvcache(req)
-        return True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3273,11 +3226,6 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
-            if self.enable_hicache_storage and self._prefetch_after_device_hit_loss(
-                req
-            ):
-                # skip this round; the re-issued lookup needs time to land
-                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
